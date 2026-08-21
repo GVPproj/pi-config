@@ -1,0 +1,23 @@
+# pi-config
+
+A standalone [Pi](https://github.com/badlogic/pi-mono) package providing Pi-only subagents and parent-owned background terminals. It targets Pi 0.84.2.
+
+## Resources
+
+- `extensions/background-terminals`: bounded, inspectable background processes
+- `extensions/subagents`: in-process Pi child agents
+- `skills/background-terminals`: guidance for background-process tools
+- `skills/subagents`: guidance for delegating work to child agents
+
+## Development
+
+```bash
+npm install
+npm run format:check
+npm run check
+npm test
+```
+
+## Attribution
+
+This package is derived from [`davis7dotsh/my-pi-setup`](https://github.com/davis7dotsh/my-pi-setup), revision [`73bf4d8`](https://github.com/davis7dotsh/my-pi-setup/commit/73bf4d826f39b5cab6b7865e706ba4a2669629ca), by Benjamin Davis. It is an independent fork and does not track upstream automatically.
