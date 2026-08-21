@@ -20,4 +20,4 @@ npm test
 
 ## Attribution
 
-This package is derived from [`davis7dotsh/my-pi-setup`](https://github.com/davis7dotsh/my-pi-setup), revision [`73bf4d8`](https://github.com/davis7dotsh/my-pi-setup/commit/73bf4d826f39b5cab6b7865e706ba4a2669629ca), by Benjamin Davis. It is an independent fork and does not track upstream automatically.
+Credit to [`davis7dotsh/my-pi-setup`](https://github.com/davis7dotsh/my-pi-setup), revision [`73bf4d8`](https://github.com/davis7dotsh/my-pi-setup/commit/73bf4d826f39b5cab6b7865e706ba4a2669629ca), by Benjamin Davis. Forking from there to do my own thing.
