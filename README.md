@@ -1,9 +1,11 @@
 # pi-config
 
-A standalone [Pi](https://github.com/badlogic/pi-mono) package providing Pi-only subagents and parent-owned background terminals. It targets Pi 0.84.2.
+A standalone [Pi](https://github.com/earendil-works/pi) package providing a custom startup screen, themes, Pi-only subagents, and parent-owned background terminals. It targets Pi 0.84.2.
 
 ## Resources
 
+- `extensions/startup-screen`: responsive welcome card with the active model, tips, tool count, and recent sessions
+- `themes`: Solarized Osaka theme
 - `extensions/background-terminals`: bounded, inspectable background processes
 - `extensions/subagents`: in-process Pi child agents
 - `skills/background-terminals`: guidance for background-process tools

@@ -2,19 +2,24 @@
   "name": "pi-config",
   "version": "0.1.0",
   "private": true,
-  "description": "Pi-only subagents and parent-owned background terminals for Pi",
+  "description": "Pi startup screen, themes, subagents, and parent-owned background terminals",
   "type": "module",
   "keywords": [
     "pi-package"
   ],
   "pi": {
     "extensions": [
+      "./extensions/startup-screen/index.ts",
       "./extensions/background-terminals/index.ts",
-      "./extensions/subagents/index.ts"
+      "./extensions/subagents/index.ts",
+      "./extensions/skill-command-highlight/index.ts"
     ],
     "skills": [
       "./skills/background-terminals",
       "./skills/subagents"
+    ],
+    "themes": [
+      "./themes"
     ]
   },
   "scripts": {
