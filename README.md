@@ -1,5 +1,7 @@
 # pi-config
 
+<img width="1140" height="334" alt="image" src="https://github.com/user-attachments/assets/0a6d71c7-4e84-4ea1-8d9e-681593bf726d" />
+
 A standalone [Pi](https://github.com/earendil-works/pi) package providing a custom startup screen, themes, Pi-only subagents, and parent-owned background terminals. It targets Pi 0.84.2.
 
 ## Resources
