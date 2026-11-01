@@ -7,7 +7,7 @@ A standalone [Pi](https://github.com/earendil-works/pi) package providing a cust
 ## Resources
 
 - `extensions/startup-screen`: responsive welcome card with the active model, tips, tool count, and recent sessions
-- `themes`: Solarized Osaka theme
+- `themes`: Solarized Osaka and Solarized Light themes
 - `extensions/background-terminals`: bounded, inspectable background processes
 - `extensions/subagents`: in-process Pi child agents
 - `skills/background-terminals`: guidance for background-process tools
