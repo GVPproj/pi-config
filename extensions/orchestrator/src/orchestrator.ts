@@ -11,12 +11,13 @@ import {
   type Models,
   type Run,
   type Job,
+  type Integration,
   type JobPlan,
   type Workers,
   type WorkerResult,
   type CheckEvidence,
 } from "./domain.ts";
-import type { Workspaces } from "./herdr.ts";
+import type { Workspace, Workspaces } from "./herdr.ts";
 import type { Publisher } from "./github.ts";
 import { git, identity, checkout, clean, revision, ancestor } from "./git.ts";
 import { command, reconcileCheck } from "./commands.ts";
@@ -252,6 +253,8 @@ export class Orchestrator {
         sha: run.plan.base,
         startingSha: run.plan.base,
         state: "queued",
+        setupIndex: 0,
+        setupEvidence: [],
         checks: [],
         artifacts: [],
       };
@@ -465,20 +468,7 @@ export class Orchestrator {
     for (const job of Object.values(run.jobs)) {
       if (input.jobId && job.id !== input.jobId) continue;
       try {
-        if (job.checkProcess) {
-          await reconcileCheck(job.checkProcess);
-          job.checks.push({
-            name: job.checkProcess.name,
-            command: job.checkProcess.command,
-            sha: job.checkProcess.sha,
-            artifact: job.checkProcess.artifact,
-            code: null,
-            cancelled: true,
-            timedOut: false,
-          });
-          job.checkProcess = undefined;
-          this.save();
-        }
+        await this.reconcilePendingCheck(job);
         if (
           input.recoverWorkspace &&
           (job.workspace || job.intent?.kind === "workspace")
@@ -519,10 +509,16 @@ export class Orchestrator {
               throw new Error(
                 "Reconciled revision discarded the approved base",
               );
+            await this.requirePrerequisites(job, sha);
             job.invalidations.push(`Explicitly accepted revision ${sha}`);
-            job.source = sha;
+            if (!job.source && ["workspace", "setup"].includes(job.stage)) {
+              job.base = sha;
+              job.stage = "setup";
+            } else {
+              job.source = sha;
+              job.stage = "checking";
+            }
             job.verification = undefined;
-            job.stage = "checking";
             job.intent = undefined;
             this.invalidateDependents(job.id);
             if (job.integration) {
@@ -577,21 +573,11 @@ export class Orchestrator {
     }
     if (run.integration) {
       const integration = run.integration;
+      // Runs approved before integration setup was recorded have no progress.
+      integration.setupIndex ??= 0;
+      integration.setupEvidence ??= [];
       try {
-        if (integration.checkProcess) {
-          await reconcileCheck(integration.checkProcess);
-          integration.checks.push({
-            name: integration.checkProcess.name,
-            command: integration.checkProcess.command,
-            sha: integration.checkProcess.sha,
-            artifact: integration.checkProcess.artifact,
-            code: null,
-            cancelled: true,
-            timedOut: false,
-          });
-          integration.checkProcess = undefined;
-          this.save();
-        }
+        await this.reconcilePendingCheck(integration);
         if (
           input.recoverWorkspace &&
           (integration.workspace || integration.intent?.kind === "workspace")
@@ -644,6 +630,16 @@ export class Orchestrator {
           throw new Error(
             "Interrupted integration workspace creation requires explicit adoption",
           );
+        if (integration.intent?.kind === "setup") {
+          if (!input.retrySetup)
+            throw new Error(
+              "Integration setup outcome ambiguous; inspect artifacts and explicitly authorize retrySetup before replaying the pending command",
+            );
+          run.history.push(
+            `Explicit integration setup retry authorized, step ${integration.setupIndex}`,
+          );
+          integration.intent = undefined;
+        }
         if (
           (run.plan.integration?.publish || integration.candidate) &&
           !integration.job
@@ -665,6 +661,24 @@ export class Orchestrator {
     run.cancelled = false;
     this.save();
     return this.inspect()!;
+  }
+  private async reconcilePendingCheck(state: Job | Integration) {
+    const pending = state.checkProcess;
+    if (!pending) return;
+    await reconcileCheck(pending);
+    const evidence =
+      state.intent?.kind === "setup" ? state.setupEvidence : state.checks;
+    evidence.push({
+      name: pending.name,
+      command: pending.command,
+      sha: pending.sha,
+      artifact: pending.artifact,
+      code: null,
+      cancelled: true,
+      timedOut: false,
+    });
+    state.checkProcess = undefined;
+    this.save();
   }
   async settled() {
     while (this.active.size)
@@ -768,31 +782,8 @@ export class Orchestrator {
       this.save();
     }
     if (job.stage === "setup") {
-      for (const setup of run.plan.setup.slice(job.setupIndex)) {
-        this.intent(job, "setup");
-        const log = this.artifact(job, "setup.log", "");
-        const result = await command(
-          cwd,
-          setup,
-          await revision(cwd),
-          log,
-          signal,
-          (process) => {
-            job.checkProcess = process;
-            this.save();
-          },
-        );
-        job.setupEvidence.push(result);
-        job.checkProcess = undefined;
-        // A recorded normal exit is not an ambiguous transport outcome.
-        if (!result.cancelled && !result.timedOut) job.intent = undefined;
-        if (result.code === 0 && !result.cancelled && !result.timedOut)
-          job.setupIndex++;
-        this.save();
-        if (result.code !== 0 || result.cancelled || result.timedOut)
-          throw new Error(`Setup failed: ${setup.name}; ${log}`);
-      }
-      await clean(cwd);
+      await this.requirePrerequisites(job, await revision(cwd));
+      await this.setup(job, job, job.workspace, signal);
       job.intent = undefined;
       job.stage = "implementation";
       this.save();
@@ -956,6 +947,41 @@ export class Orchestrator {
     if (digest(result.model) !== digest(this.run!.plan.models[role]))
       throw new Error("Worker model differs from approved frozen choice");
     return result;
+  }
+  private async setup(
+    job: Job,
+    state: Job | Integration,
+    workspace: Workspace,
+    signal: AbortSignal,
+  ) {
+    const cwd = workspace.path;
+    await clean(cwd);
+    for (const setup of this.run!.plan.setup.slice(state.setupIndex)) {
+      const sha = await revision(cwd);
+      this.intent(state, "setup", sha);
+      const log = this.artifact(job, "setup.log", "");
+      if (state !== job) state.artifacts.push(log);
+      const result = await command(cwd, setup, sha, log, signal, (process) => {
+        state.checkProcess = process;
+        this.save();
+      });
+      state.setupEvidence.push(result);
+      state.checkProcess = undefined;
+      // Keep successful execution pending until source validation and progress
+      // are persisted together; a crash must not silently replay the command.
+      if (result.code !== 0 && !result.cancelled && !result.timedOut)
+        state.intent = undefined;
+      this.save();
+      if (result.code !== 0 || result.cancelled || result.timedOut)
+        throw new Error(`Setup failed: ${setup.name}; ${log}`);
+      if ((await revision(cwd)) !== sha)
+        throw new Error(`Setup changed source revision: ${setup.name}; ${log}`);
+      await checkout(this.run!.identity, workspace, sha);
+      await clean(cwd);
+      state.setupIndex++;
+      state.intent = undefined;
+      this.save();
+    }
   }
   private async checks(
     job: Job,
@@ -1133,7 +1159,17 @@ export class Orchestrator {
             !(await ancestor(cwd, job.source!, sha))
           )
             throw new Error("Integration repair discarded accepted work");
+          // The repair is now committed. Recovery must verify this candidate,
+          // not spend another repair cycle before resuming its pending setup.
+          integration.feedback = undefined;
+          this.save();
         }
+        if (integration.setupSha !== sha) {
+          integration.setupSha = sha;
+          integration.setupIndex = 0;
+          this.save();
+        }
+        await this.setup(job, integration, integration.workspace, signal);
         await this.checks(job, cwd, sha, signal, true);
         if (feedback) {
           const diff = this.artifact(
@@ -1241,6 +1277,17 @@ export class Orchestrator {
       this.invalidateDependents(job.id);
     }
   }
+  private async requirePrerequisites(job: Job, sha: string) {
+    const spec = this.run!.plan.jobs.find((spec) => spec.id === job.id)!;
+    for (const id of spec.dependencies) {
+      const prerequisite = job.dependencies[id];
+      if (
+        !prerequisite ||
+        !(await ancestor(job.workspace!.path, prerequisite, sha))
+      )
+        throw new Error(`Prerequisite ${id} is missing from revision ${sha}`);
+    }
+  }
   private async verify(job: Job) {
     if (
       !job.workspace ||
@@ -1251,6 +1298,7 @@ export class Orchestrator {
     try {
       await checkout(this.run!.identity, job.workspace, job.verification.sha);
       await clean(job.workspace.path);
+      await this.requirePrerequisites(job, job.verification.sha);
       for (const [id, sha] of Object.entries(job.dependencies))
         if (this.run!.jobs[id].verification?.sha !== sha)
           throw new Error(

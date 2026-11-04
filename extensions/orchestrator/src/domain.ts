@@ -163,6 +163,9 @@ export interface Job {
 }
 export interface Integration {
   workspace?: import("./herdr.ts").Workspace;
+  setupIndex: number;
+  setupEvidence: CheckEvidence[];
+  setupSha?: string;
   sha: string;
   startingSha: string;
   state: ExecutionState;

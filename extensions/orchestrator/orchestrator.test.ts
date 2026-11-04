@@ -380,6 +380,162 @@ test("dependent jobs use verified prerequisite commits and explicit stacked PR b
   await engine.close();
 });
 
+test("recovery cannot accept an interrupted composition that omits a verified prerequisite", async (t) => {
+  const { engine, options } = await harness(t, async (input) => {
+    if (input.role === "review") return '{"verdict":"pass","findings":[]}';
+    const name = input.cwd.endsWith("/three")
+      ? "three"
+      : input.cwd.endsWith("/two")
+        ? "two"
+        : "one";
+    await writeFile(
+      join(input.cwd, name === "three" ? "three.txt" : "initial.txt"),
+      `${name} requirement\n`,
+    );
+    git(input.cwd, "add", ".");
+    git(input.cwd, "commit", "-m", `implement ${name}`);
+    return "done";
+  });
+  t.after(() => engine.close());
+  const p = plan("HEAD");
+  p.delivery = "integration";
+  delete p.destination;
+  p.integration = { branch: "orchestrator/test/integration", publish: false };
+  p.concurrency = 1;
+  p.setup = [{ name: "setup", command: "true", timeoutMs: 1000 }];
+  p.checks[0].command = "test -f initial.txt";
+  p.jobs.push(
+    {
+      ...structuredClone(p.jobs[0]),
+      id: "two",
+      branch: "orchestrator/test/two",
+    },
+    {
+      ...structuredClone(p.jobs[0]),
+      id: "three",
+      branch: "orchestrator/test/three",
+      dependencies: ["one", "two"],
+    },
+  );
+  await engine.approve((await engine.prepare(p)).digest);
+  await engine.start();
+  await engine.settled();
+  const stopped = engine.inspect()!;
+  assert.equal(stopped.jobs.three.intent?.kind, "compose-prerequisites");
+  const cwd = stopped.jobs.three.workspace!.path;
+  // The user aborts the unresolved second merge; the first merge is retained.
+  git(cwd, "merge", "--abort");
+  const incomplete = git(cwd, "rev-parse", "HEAD");
+  assert.throws(() =>
+    git(
+      cwd,
+      "merge-base",
+      "--is-ancestor",
+      stopped.jobs.two.source!,
+      incomplete,
+    ),
+  );
+  await engine.close();
+  const recovered = new Orchestrator(options);
+  t.after(() => recovered.close());
+  await recovered.resume({
+    runId: stopped.id,
+    jobId: "three",
+    acceptRevision: incomplete,
+  });
+  const job = recovered.inspect()!.jobs.three;
+  assert.equal(job.state, "blocked");
+  assert.match(
+    job.blocker!,
+    /prerequisite two.*(?:missing|ancestor)|missing.*prerequisite two/i,
+  );
+  assert.equal(job.verification, undefined);
+  assert.equal(job.source, undefined);
+  assert.equal(job.attempts, 0);
+
+  // Resolve the missing parent manually; recovery must still run setup and implementation.
+  assert.throws(() => git(cwd, "merge", "--no-ff", stopped.jobs.two.source!));
+  await writeFile(join(cwd, "initial.txt"), "one and two requirements\n");
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "resolve both prerequisite requirements");
+  const composed = git(cwd, "rev-parse", "HEAD");
+  await recovered.resume({ jobId: "three", acceptRevision: composed });
+  const accepted = recovered.inspect()!.jobs.three;
+  assert.equal(accepted.stage, "setup");
+  assert.equal(accepted.base, composed);
+  assert.equal(accepted.source, undefined);
+  await recovered.start();
+  await recovered.settled();
+  const completed = recovered.inspect()!.jobs.three;
+  assert.equal(
+    completed.state,
+    "complete",
+    completed.blocker ?? "Recovery should finish composition",
+  );
+  assert.equal(completed.setupEvidence.length, 1);
+  assert.equal(completed.attempts, 1);
+  assert.equal(
+    git(cwd, "show", `${completed.source}:three.txt`),
+    "three requirement",
+  );
+  for (const parent of [stopped.jobs.one.source!, stopped.jobs.two.source!])
+    git(cwd, "merge-base", "--is-ancestor", parent, completed.source!);
+});
+
+test("adopting an interrupted multi-parent workspace cannot skip prerequisite composition", async (t) => {
+  const { engine, options } = await harness(t, async (input) => {
+    if (input.role === "review") return '{"verdict":"pass","findings":[]}';
+    const name = input.cwd.split("/").at(-1)!;
+    await writeFile(join(input.cwd, `${name}.txt`), `${name}\n`);
+    git(input.cwd, "add", ".");
+    git(input.cwd, "commit", "-m", `implement ${name}`);
+    return "done";
+  });
+  t.after(() => engine.close());
+  const p = plan("HEAD");
+  p.delivery = "integration";
+  delete p.destination;
+  p.integration = { branch: "orchestrator/test/integration", publish: false };
+  p.checks[0].command = "test -f initial.txt";
+  p.jobs.push(
+    {
+      ...structuredClone(p.jobs[0]),
+      id: "two",
+      branch: "orchestrator/test/two",
+    },
+    {
+      ...structuredClone(p.jobs[0]),
+      id: "three",
+      branch: "orchestrator/test/three",
+      dependencies: ["one", "two"],
+    },
+  );
+  const create = options.workspaces.create;
+  options.workspaces.create = async (input) => {
+    const workspace = await create(input);
+    if (input.branch.endsWith("/three"))
+      throw new Error("Transport lost after native checkout creation");
+    return workspace;
+  };
+  options.workspaces.recover = async (input) => ({
+    path: input.path,
+    branch: input.branch,
+    workspaceId: "recovered",
+  });
+  await engine.approve((await engine.prepare(p)).digest);
+  await engine.start();
+  await engine.settled();
+  assert.equal(engine.inspect()!.jobs.three.intent?.kind, "workspace");
+  await engine.resume({ jobId: "three", recoverWorkspace: true });
+  await engine.start();
+  await engine.settled();
+  const job = engine.inspect()!.jobs.three;
+  assert.equal(job.state, "blocked");
+  assert.match(job.blocker!, /prerequisite.*missing|missing.*prerequisite/i);
+  assert.equal(job.attempts, 0);
+  assert.equal(job.verification, undefined);
+});
+
 test("integration combines verified sources in a separate single-writer checkout and checks every result", async (t) => {
   const { engine, repo } = await harness(t, async (input) => {
     if (input.role === "review") return '{"verdict":"pass","findings":[]}';
@@ -391,11 +547,22 @@ test("integration combines verified sources in a separate single-writer checkout
     git(input.cwd, "commit", "-m", "implement");
     return "done";
   });
+  await writeFile(join(repo, ".gitignore"), ".setup-state\n");
+  git(repo, "add", ".");
+  git(repo, "commit", "-m", "ignore revision-specific setup resource");
   const p = plan("HEAD");
   p.delivery = "integration";
   delete p.destination;
   p.integration = { branch: "orchestrator/test/integration", publish: false };
-  p.checks[0].command = "test -f initial.txt";
+  p.setup = [
+    {
+      name: "prepare candidate resources",
+      command: "git rev-parse HEAD > .setup-state",
+      timeoutMs: 1000,
+    },
+  ];
+  p.checks[0].command =
+    'test -f initial.txt && case "$PWD" in */integration) read prepared < .setup-state; test "$prepared" = "$(git rev-parse HEAD)";; esac';
   p.jobs.push({
     ...structuredClone(p.jobs[0]),
     id: "two",
@@ -411,8 +578,215 @@ test("integration combines verified sources in a separate single-writer checkout
   assert.equal(run.jobs.two.integration?.source, run.jobs.two.source);
   assert.equal(run.integration!.checks.length, 2);
   assert.equal(run.integration!.checks[1].sha, run.integration!.sha);
+  assert.deepEqual(
+    run.integration!.setupEvidence.map((evidence) => evidence.sha),
+    run.integration!.checks.map((evidence) => evidence.sha),
+  );
   assert.equal(git(repo, "rev-parse", "HEAD"), run.plan.base);
   await engine.close();
+});
+
+test("integration prepares its own checkout before checking the merged revision", async (t) => {
+  const { engine, repo } = await harness(t);
+  t.after(() => engine.close());
+  await writeFile(join(repo, ".gitignore"), ".setup-state\n");
+  git(repo, "add", ".");
+  git(repo, "commit", "-m", "ignore setup resource");
+  const p = plan("HEAD");
+  p.delivery = "integration";
+  delete p.destination;
+  p.integration = { branch: "orchestrator/test/integration", publish: false };
+  p.setup = [
+    {
+      name: "prepare local resources",
+      command: "mkdir -p .setup-state && touch .setup-state/ready",
+      timeoutMs: 1000,
+    },
+  ];
+  p.checks[0].command = "test -f one.txt && test -f .setup-state/ready";
+  await engine.approve((await engine.prepare(p)).digest);
+  await engine.start();
+  await engine.settled();
+  const run = engine.inspect()!;
+  assert.equal(
+    run.integration!.state,
+    "complete",
+    run.integration!.blocker ??
+      "Integration setup should prepare local resources",
+  );
+  assert.equal(run.jobs.one.repairs, 0);
+  assert.equal(run.integration!.setupEvidence[0].code, 0);
+  assert.equal(run.integration!.setupEvidence[0].sha, run.integration!.sha);
+  assert.equal(run.integration!.checks[0].sha, run.integration!.sha);
+});
+
+test("interrupted integration setup requires retry approval and preserves completed steps", async (t) => {
+  const { engine, options, repo, dir } = await harness(t);
+  t.after(() => engine.close());
+  await writeFile(join(repo, ".gitignore"), ".setup-state\n");
+  git(repo, "add", ".");
+  git(repo, "commit", "-m", "ignore setup resource");
+  const ready = join(dir, "resource-ready");
+  const p = plan("HEAD");
+  p.delivery = "integration";
+  delete p.destination;
+  p.integration = { branch: "orchestrator/test/integration", publish: false };
+  p.setup = [
+    {
+      name: "one-time setup",
+      command: "test ! -e .setup-state && touch .setup-state",
+      timeoutMs: 1000,
+    },
+    {
+      name: "resource",
+      command: `case "$PWD" in */integration) test -e '${ready}' || sleep 30;; *) true;; esac`,
+      timeoutMs: 60_000,
+    },
+  ];
+  let atSetup!: () => void;
+  const reached = new Promise<void>((resolve) => {
+    atSetup = resolve;
+  });
+  Object.assign(options, {
+    changed(run: import("./src/domain.ts").Run) {
+      if (
+        run.integration?.intent?.kind === "setup" &&
+        run.integration.checkProcess?.name === "resource"
+      )
+        atSetup();
+    },
+  });
+  await engine.approve((await engine.prepare(p)).digest);
+  await engine.start();
+  await reached;
+  await engine.cancel();
+  const stopped = engine.inspect()!;
+  assert.equal(stopped.integration!.setupIndex, 1);
+  const candidate = git(
+    stopped.integration!.workspace!.path,
+    "rev-parse",
+    "HEAD",
+  );
+  await engine.close();
+  const recovered = new Orchestrator(options);
+  t.after(() => recovered.close());
+  await recovered.resume({
+    runId: stopped.id,
+    acceptIntegrationRevision: candidate,
+  });
+  assert.equal(recovered.inspect()!.integration!.state, "blocked");
+  assert.match(
+    recovered.inspect()!.integration!.blocker!,
+    /setup.*retrySetup/i,
+  );
+  await writeFile(ready, "ready\n");
+  await recovered.resume({
+    acceptIntegrationRevision: candidate,
+    retrySetup: true,
+  });
+  await recovered.start();
+  await recovered.settled();
+  const integration = recovered.inspect()!.integration!;
+  assert.equal(
+    integration.state,
+    "complete",
+    integration.blocker ?? "Setup should resume",
+  );
+  assert.equal(integration.setupIndex, 2);
+  assert.equal(integration.setupEvidence.length, 3);
+  assert.equal(integration.setupEvidence[0].code, 0);
+  assert.equal(integration.setupEvidence[1].cancelled, true);
+  assert.equal(integration.setupEvidence[2].code, 0);
+  assert.equal(integration.checks.length, 1);
+  assert.equal(recovered.inspect()!.jobs.one.repairs, 0);
+});
+
+test("resuming setup on a repaired integration candidate does not repeat the repair", async (t) => {
+  const { engine, options, repo, dir } = await harness(t, async (input) => {
+    if (input.role === "review") return '{"verdict":"pass","findings":[]}';
+    await writeFile(
+      join(input.cwd, input.role === "conflict" ? "ci-fix.txt" : "one.txt"),
+      "done\n",
+    );
+    git(input.cwd, "add", ".");
+    git(input.cwd, "commit", "-m", "scoped change");
+    return "done";
+  });
+  t.after(() => engine.close());
+  await writeFile(join(repo, ".gitignore"), ".setup-state/\n");
+  git(repo, "add", ".");
+  git(repo, "commit", "-m", "ignore candidate setup resources");
+  const ready = join(dir, "resource-ready");
+  const p = plan("HEAD");
+  p.delivery = "integration";
+  p.integration = { branch: "orchestrator/test/integration", publish: true };
+  p.requiredCI = ["CI"];
+  p.repairLimit = 1;
+  p.setup = [
+    {
+      name: "one-time candidate setup",
+      command:
+        'mkdir -p .setup-state && sha=$(git rev-parse HEAD) && test ! -e ".setup-state/$sha" && touch ".setup-state/$sha"',
+      timeoutMs: 1000,
+    },
+    {
+      name: "resource",
+      command: `if test -f ci-fix.txt && ! test -e '${ready}'; then sleep 30; fi`,
+      timeoutMs: 60_000,
+    },
+  ];
+  let observations = 0;
+  options.publisher.ci = async (_destination, sha) => ({
+    sha,
+    state: ++observations === 1 ? "failed" : "passed",
+    checks: [],
+  });
+  let atSetup!: () => void;
+  const reached = new Promise<void>((resolve) => {
+    atSetup = resolve;
+  });
+  Object.assign(options, {
+    changed(run: import("./src/domain.ts").Run) {
+      if (
+        run.jobs.one.repairs === 1 &&
+        run.integration?.intent?.kind === "setup" &&
+        run.integration.checkProcess?.name === "resource"
+      )
+        atSetup();
+    },
+  });
+  await engine.approve((await engine.prepare(p)).digest);
+  await engine.start();
+  await reached;
+  await engine.cancel();
+  const stopped = engine.inspect()!;
+  assert.equal(stopped.integration!.setupIndex, 1);
+  const candidate = git(
+    stopped.integration!.workspace!.path,
+    "rev-parse",
+    "HEAD",
+  );
+  await engine.close();
+  const recovered = new Orchestrator(options);
+  t.after(() => recovered.close());
+  await writeFile(ready, "ready\n");
+  await recovered.resume({
+    runId: stopped.id,
+    acceptIntegrationRevision: candidate,
+    retrySetup: true,
+  });
+  await recovered.start();
+  await recovered.settled();
+  const run = recovered.inspect()!;
+  assert.equal(
+    run.integration!.state,
+    "complete",
+    run.integration!.blocker ?? "Repaired setup should resume",
+  );
+  assert.equal(run.integration!.sha, candidate);
+  assert.equal(run.jobs.one.repairs, 1);
+  assert.equal(run.integration!.setupEvidence.length, 5);
+  assert.equal(run.integration!.setupEvidence.at(-1)!.code, 0);
 });
 
 test("semantic integration failures use the same bounded repair budget without rewriting PR sources", async (t) => {
@@ -930,6 +1304,33 @@ test("malformed integration review is a missing-evidence blocker, not another re
   assert.equal(run.jobs.one.repairs, 1);
   assert.match(run.integration!.blocker!, /malformed|evidence/i);
   await engine.close();
+});
+
+test("setup that commits tracked source changes blocks before advancing or starting a worker", async (t) => {
+  const { engine, publications } = await harness(t);
+  t.after(() => engine.close());
+  const p = plan("HEAD");
+  p.setup = [
+    {
+      name: "source-changing setup",
+      command:
+        "printf 'changed by setup\\n' > initial.txt && git add initial.txt && git commit -m 'setup changed source'",
+      timeoutMs: 1000,
+    },
+    { name: "must not run", command: "exit 1", timeoutMs: 1000 },
+  ];
+  await engine.approve((await engine.prepare(p)).digest);
+  await engine.start();
+  await engine.settled();
+  const job = engine.inspect()!.jobs.one;
+  assert.equal(job.state, "blocked");
+  assert.match(job.blocker!, /setup.*(?:source|revision)/i);
+  assert.equal(job.setupIndex, 0);
+  assert.equal(job.setupEvidence.length, 1);
+  assert.equal(job.attempts, 0);
+  assert.equal(publications.size, 0);
+  assert.notEqual(git(job.workspace!.path, "rev-parse", "HEAD"), job.base);
+  assert.equal(git(job.workspace!.path, "status", "--porcelain"), "");
 });
 
 test("resuming a failed setup preserves completed setup steps rather than replaying them", async (t) => {
