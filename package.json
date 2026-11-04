@@ -11,12 +11,14 @@
     "extensions": [
       "./extensions/startup-screen/index.ts",
       "./extensions/background-terminals/index.ts",
+      "./extensions/orchestrator/index.ts",
       "./extensions/subagents/index.ts",
       "./extensions/skill-command-highlight/index.ts"
     ],
     "skills": [
       "./skills/background-terminals",
-      "./skills/subagents"
+      "./skills/subagents",
+      "./skills/orchestrate"
     ],
     "themes": [
       "./themes"
@@ -26,7 +28,8 @@
     "check": "tsc --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "node --test --experimental-strip-types extensions/background-terminals/*.test.ts extensions/subagents/*.test.ts"
+    "test": "node --test --experimental-strip-types extensions/background-terminals/*.test.ts extensions/subagents/*.test.ts extensions/orchestrator/*.test.ts",
+    "test:herdr": "ORCHESTRATOR_HERDR_TEST=1 node --test --experimental-strip-types extensions/orchestrator/herdr.acceptance.test.ts"
   },
   "dependencies": {
     "effect": "^4.0.0-beta.99"

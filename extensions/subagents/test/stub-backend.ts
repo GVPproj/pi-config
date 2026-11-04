@@ -35,6 +35,7 @@ export interface StubProfile {
   readonly toolName: string;
   /** Delay between scripted events; varies per backend so streams differ. */
   readonly cadenceMs: number;
+  readonly interruptDelayMs?: number;
 }
 
 const STUB_DIR = path.join(os.tmpdir(), "subagents-stub");
@@ -266,6 +267,8 @@ const makeStubSession = (
       events: Stream.fromQueue(events),
       send: submit,
       interrupt: Effect.gen(function* () {
+        if (profile.interruptDelayMs)
+          yield* Effect.sleep(profile.interruptDelayMs);
         // Drop queued prompts so interrupting cannot immediately start
         // another turn, then stop the active turn. A prompt may be mid-flight
         // between the driver dequeuing it and registering its fiber, so wait
