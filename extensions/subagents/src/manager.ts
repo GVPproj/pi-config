@@ -26,6 +26,8 @@ import { BackendRegistry } from "./backend.ts";
 import type {
   BackendName,
   LiveToolState,
+  OwnedSpawnTask,
+  SubagentOwner,
   RunOutcome,
   SpawnTask,
   SubagentEvent,
@@ -73,6 +75,10 @@ interface MutableSnapshot {
   prompt: string;
   cwd: string;
   status: SubagentStatus;
+  ownerId?: string;
+  execution?: SubagentSnapshot["execution"];
+  readOnly?: boolean;
+  outcome?: RunOutcome["_tag"];
   createdAt: number;
   settledAt?: number;
   errorText?: string;
@@ -88,6 +94,7 @@ interface MutableSnapshot {
 
 interface Entry {
   snapshot: MutableSnapshot;
+  owner?: SubagentOwner;
   session: SubagentSession;
   scope: Scope.Closeable;
   pump?: Fiber.Fiber<void>;
@@ -95,6 +102,10 @@ interface Entry {
   /** Idle restart dispatched but RunStarted not folded yet; counts as running
    * so concurrent restarts cannot race past the cap. */
   restarting?: boolean;
+  cancelling?: boolean;
+  stopping?: boolean;
+  stopOutcome?: RunOutcome;
+  closed?: boolean;
 }
 
 // --- Read model ----------------------------------------------------------------
@@ -104,6 +115,8 @@ export interface SubagentReadModel {
   list(): ReadonlyArray<SubagentSnapshot>;
   get(id: string): SubagentSnapshot | undefined;
   size(): number;
+  /** Includes reservations and restarts, not only visible running sessions. */
+  availableSlots(): number;
   /** Any-change notification (footer status, dashboard). */
   subscribe(listener: () => void): () => void;
   /** Per-subagent notification (takeover view). */
@@ -132,6 +145,10 @@ export interface CancelResult {
 }
 
 export interface SubagentManagerShape {
+  spawnOwned(
+    task: OwnedSpawnTask,
+    owner: SubagentOwner,
+  ): Effect.Effect<SubagentSnapshot, SpawnError | ConcurrencyLimitError>;
   spawn(
     task: SpawnTask,
   ): Effect.Effect<SubagentSnapshot, SpawnError | ConcurrencyLimitError>;
@@ -150,6 +167,15 @@ export interface SubagentManagerShape {
     ids: ReadonlyArray<string>,
   ): Effect.Effect<ReadonlyArray<CancelResult>>;
   send(id: string, text: string): Effect.Effect<void, SendError>;
+  sendOwned(
+    owner: SubagentOwner,
+    id: string,
+    text: string,
+  ): Effect.Effect<void, SendError>;
+  cancelOwned(
+    owner: SubagentOwner,
+    ids: ReadonlyArray<string>,
+  ): Effect.Effect<ReadonlyArray<CancelResult>, SendError>;
   get(id: string): Effect.Effect<SubagentSnapshot | undefined>;
   readonly list: Effect.Effect<ReadonlyArray<SubagentSnapshot>>;
   readonly disposeAll: Effect.Effect<void>;
@@ -259,7 +285,12 @@ const makeManager = Effect.gen(function* () {
     const s = entry.snapshot;
     entry.restarting = false;
     if (s.status !== "running") return;
+    if (entry.stopping) {
+      entry.stopOutcome = outcome;
+      return;
+    }
     s.settledAt = Date.now();
+    s.outcome = outcome._tag;
     switch (outcome._tag) {
       case "Completed":
         s.status = "done";
@@ -292,7 +323,8 @@ const makeManager = Effect.gen(function* () {
     notify(s.id);
     try {
       // During teardown, don't queue results into a shutting-down session.
-      if (!disposed) onSettled?.(s, consumed);
+      if (entry.owner) entry.owner.onSettled(structuredClone(s));
+      else if (!disposed) onSettled?.(s, consumed);
     } catch {
       // The parent session may be unavailable; settlement stays final.
     }
@@ -307,6 +339,8 @@ const makeManager = Effect.gen(function* () {
         s.status = "running";
         s.settledAt = undefined;
         s.errorText = undefined;
+        s.outcome = undefined;
+        s.finalText = "";
         break;
       case "RunSettled":
         settle(entry, event.outcome);
@@ -407,7 +441,7 @@ const makeManager = Effect.gen(function* () {
     notify(s.id);
   };
 
-  const spawn = (task: SpawnTask) =>
+  const spawn = (task: SpawnTask, owner?: SubagentOwner) =>
     Effect.gen(function* () {
       // Reserve synchronously (before the first yield inside doSpawn) so
       // parallel tool calls cannot race past the global cap.
@@ -450,6 +484,7 @@ const makeManager = Effect.gen(function* () {
         const id = `sa-${++counter}`;
         const meta = yield* session.meta;
         const entry: Entry = {
+          owner,
           snapshot: {
             id,
             backend: "pi",
@@ -457,6 +492,9 @@ const makeManager = Effect.gen(function* () {
             prompt: task.prompt,
             cwd: task.cwd,
             status: "running",
+            ownerId: owner?.id,
+            execution: task.execution,
+            readOnly: task.readOnly,
             createdAt: Date.now(),
             meta,
             usage: { contextWindow: meta.contextWindow },
@@ -535,29 +573,31 @@ const makeManager = Effect.gen(function* () {
   /** Interrupt one running entry, force-closing its scope after 5s. */
   const abortEntry = (entry: Entry) =>
     Effect.gen(function* () {
-      if (entry.snapshot.status !== "running") return;
+      if (entry.snapshot.status !== "running" || entry.stopping) return;
+      entry.stopping = true;
       const graceful = yield* entry.session.interrupt.pipe(
         Effect.timeout(STOP_TIMEOUT_MS),
         Effect.result,
       );
       if (Result.isFailure(graceful)) {
-        // Settle before closing the scope so the pump's stream-ended
-        // fallback ("Backend event stream ended unexpectedly") cannot win
-        // the race and report the wrong terminal reason.
-        yield* Effect.sync(() => {
-          settle(entry, { _tag: "Interrupted" });
-          entry.snapshot.errorText =
-            "Abort deadline exceeded; session was force-disposed";
-          notify(entry.snapshot.id);
-        });
-        // Bound the close like disposeAll does: a stuck backend finalizer
-        // must not hang cancel after the run is already settled.
+        entry.closed = true;
+        // Keep the slot occupied and defer delivery until teardown finishes.
         yield* closeEntryScope(entry).pipe(
           Effect.timeout(STOP_TIMEOUT_MS),
           Effect.ignore,
         );
       }
-    });
+      entry.stopping = false;
+      const outcome = entry.stopOutcome;
+      entry.stopOutcome = undefined;
+      settle(entry, {
+        _tag: "Interrupted",
+        partialText:
+          outcome?._tag === "Completed"
+            ? outcome.finalText
+            : outcome?.partialText,
+      });
+    }).pipe(Effect.uninterruptible);
 
   const cancel = (ids: ReadonlyArray<string>) =>
     Effect.suspend(() => {
@@ -568,6 +608,7 @@ const makeManager = Effect.gen(function* () {
           (entry): entry is Entry => entry?.snapshot.status === "running",
         );
       const runningIds = running.map((entry) => entry.snapshot.id);
+      for (const entry of running) entry.cancelling = true;
       // Mark consumed before interrupting so cancellation does not also
       // enqueue duplicate automatic result messages into the parent.
       addInterest(runningIds);
@@ -582,6 +623,7 @@ const makeManager = Effect.gen(function* () {
       return work.pipe(
         Effect.ensuring(
           Effect.sync(() => {
+            for (const entry of running) entry.cancelling = false;
             releaseInterest(runningIds);
             pruneSettled();
           }),
@@ -600,12 +642,27 @@ const makeManager = Effect.gen(function* () {
       );
     });
 
-  const send = (id: string, text: string) =>
+  const send = (id: string, text: string, owner?: SubagentOwner) =>
     Effect.suspend((): Effect.Effect<void, SendError> => {
       const entry = entries.get(id);
       if (!entry || disposed) {
         return new SendError({
           message: `Subagent "${id}" is no longer tracked.`,
+        });
+      }
+      if (entry.owner !== owner) {
+        return new SendError({
+          message: `Subagent "${id}" requires its owner's authorization.`,
+        });
+      }
+      if (
+        entry.restarting ||
+        entry.cancelling ||
+        entry.stopping ||
+        entry.closed
+      ) {
+        return new SendError({
+          message: `Subagent "${id}" is restarting, stopping, or closed.`,
         });
       }
       // Restarting a settled subagent occupies a running slot again, so it
@@ -621,11 +678,20 @@ const makeManager = Effect.gen(function* () {
         // arrives via the async pump, and two concurrent restarts must not
         // both pass the check in that window. Cleared by RunStarted/settle,
         // or here when the backend rejects the send.
+        const previous = { ...entry.snapshot };
         entry.restarting = true;
+        entry.snapshot.status = "running";
+        entry.snapshot.settledAt = undefined;
+        entry.snapshot.outcome = undefined;
+        entry.snapshot.errorText = undefined;
+        entry.snapshot.finalText = "";
+        notify(id);
         return entry.session.send(text).pipe(
           Effect.onError(() =>
             Effect.sync(() => {
               entry.restarting = false;
+              Object.assign(entry.snapshot, previous);
+              notify(id);
             }),
           ),
         );
@@ -640,10 +706,16 @@ const makeManager = Effect.gen(function* () {
     yield* Effect.forEach(
       all,
       (entry) =>
-        closeEntryScope(entry).pipe(
-          Effect.timeout(STOP_TIMEOUT_MS),
-          Effect.ignore,
-        ),
+        Effect.gen(function* () {
+          entry.stopping = true;
+          entry.closed = true;
+          yield* closeEntryScope(entry).pipe(
+            Effect.timeout(STOP_TIMEOUT_MS),
+            Effect.ignore,
+          );
+          entry.stopping = false;
+          settle(entry, { _tag: "Interrupted" });
+        }),
       { concurrency: "unbounded" },
     );
     // Pruning cleanups are detached; bound them like everything else so a
@@ -661,6 +733,8 @@ const makeManager = Effect.gen(function* () {
     list: () => [...entries.values()].map((entry) => entry.snapshot),
     get: (id) => entries.get(id)?.snapshot,
     size: () => entries.size,
+    availableSlots: () =>
+      disposed ? 0 : Math.max(0, MAX_RUNNING - runningCount() - reserved),
     subscribe: (listener) => {
       listeners.add(listener);
       return () => listeners.delete(listener);
@@ -697,10 +771,45 @@ const makeManager = Effect.gen(function* () {
   yield* Effect.addFinalizer(() => disposeAll);
 
   return SubagentManager.of({
+    spawnOwned: (task, owner) => {
+      if (
+        !task.execution?.model?.provider ||
+        !task.execution.model.id ||
+        !task.execution.thinkingLevel ||
+        !owner?.id ||
+        typeof owner.onSettled !== "function"
+      ) {
+        return new SpawnError({
+          message:
+            "Owned spawn requires an owner and explicit model/thinking execution choice.",
+        });
+      }
+      const execution = Object.freeze({
+        model: Object.freeze({ ...task.execution.model }),
+        thinkingLevel: task.execution.thinkingLevel,
+      });
+      return spawn({ ...task, execution, parent: { ...task.parent } }, owner);
+    },
     spawn,
     waitFor,
     cancel,
+    cancelOwned: (owner, ids) =>
+      Effect.suspend(() => {
+        if (
+          disposed ||
+          ids.some(
+            (id) => !entries.get(id)?.owner || entries.get(id)?.owner !== owner,
+          )
+        ) {
+          return new SendError({
+            message:
+              "Cancellation requires the exact owner of every tracked subagent.",
+          });
+        }
+        return cancel(ids);
+      }),
     send,
+    sendOwned: (owner, id, text) => send(id, text, owner),
     get: (id) => Effect.sync(() => entries.get(id)?.snapshot),
     list: Effect.sync(() => [...entries.values()].map((e) => e.snapshot)),
     disposeAll,

@@ -408,7 +408,7 @@ class TakeoverView implements Component, Focusable {
     this.ticker = setInterval(() => this.tui.requestRender(), 1000);
     this.input.onSubmit = (value: string) => {
       const text = value.trim();
-      if (!text) return;
+      if (!text || this.snap()?.ownerId !== undefined) return;
       this.input.setValue("");
       this.view.requestSend(this.id, text);
       this.scrollOffset = 0;
@@ -487,7 +487,7 @@ class TakeoverView implements Component, Focusable {
       this.tui.requestRender();
       return;
     }
-    this.input.handleInput(data);
+    if (this.snap()?.ownerId === undefined) this.input.handleInput(data);
     this.tui.requestRender();
   }
 
@@ -563,12 +563,24 @@ class TakeoverView implements Component, Focusable {
     lines.push(...body.slice(0, viewport));
 
     lines.push(border);
-    lines.push(...this.input.render(width));
+    lines.push(
+      ...(snap.ownerId !== undefined
+        ? [
+            truncateToWidth(
+              theme.fg(
+                "muted",
+                `Owned by ${snap.ownerId}: inspect/abort here; send through the owner.`,
+              ),
+              width,
+            ),
+          ]
+        : this.input.render(width)),
+    );
     lines.push(
       truncateToWidth(
         theme.fg(
           "dim",
-          `${configuredKeys(this.keybindings, "tui.input.submit")} send · ${configuredKeys(this.keybindings, "app.interrupt")} back · ${configuredKeys(this.keybindings, "app.clear")} abort run · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")} scroll · ${configuredKeys(this.keybindings, "tui.editor.pageUp")}/${configuredKeys(this.keybindings, "tui.editor.pageDown")} page`,
+          `${snap.ownerId === undefined ? `${configuredKeys(this.keybindings, "tui.input.submit")} send · ` : ""}${configuredKeys(this.keybindings, "app.interrupt")} back · ${configuredKeys(this.keybindings, "app.clear")} abort run · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")} scroll · ${configuredKeys(this.keybindings, "tui.editor.pageUp")}/${configuredKeys(this.keybindings, "tui.editor.pageDown")} page`,
         ),
         width,
       ),

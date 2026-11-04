@@ -12,6 +12,7 @@
  */
 
 import type { AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
+import { clampThinkingLevel } from "@earendil-works/pi-ai/compat";
 import type {
   AgentSession,
   AgentSessionEvent,
@@ -20,6 +21,7 @@ import type {
 import {
   createAgentSession,
   DefaultResourceLoader,
+  DefaultPackageManager,
   getAgentDir,
   SessionManager,
   SettingsManager,
@@ -37,6 +39,8 @@ import { SendError, SpawnError } from "../domain.ts";
 import {
   applyChildToolPolicy,
   CHILD_EXCLUDED_TOOL_NAMES,
+  isChildExcludedExtension,
+  isChildExcludedToolName,
 } from "../child-policy.ts";
 import { createToolCallTimeoutGuard } from "../../../shared/tool-call-timeout.ts";
 
@@ -88,12 +92,45 @@ export function resolvePiModel(
 // --- Child session helpers (ported from v1 shared/child-session.ts) -----------
 
 /** Load normal global/package resources and trust-gated project resources. */
-async function createChildResources(cwd: string, projectTrusted: boolean) {
+async function createChildResources(
+  cwd: string,
+  projectTrusted: boolean,
+  readOnly = false,
+) {
   const agentDir = getAgentDir();
   const settingsManager = SettingsManager.create(cwd, agentDir, {
     projectTrusted,
   });
-  const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+  const paths = await new DefaultPackageManager({
+    cwd,
+    agentDir,
+    settingsManager,
+  }).resolve();
+  const loader = new DefaultResourceLoader({
+    cwd,
+    agentDir,
+    settingsManager,
+    noExtensions: true,
+    additionalExtensionPaths: paths.extensions
+      .filter(
+        (resource) =>
+          resource.enabled && !isChildExcludedExtension(resource.path),
+      )
+      .map((resource) => resource.path),
+    extensionFactories: [
+      (pi) => {
+        // An active-tool filter alone does not stop late activation or nested calls.
+        pi.on("tool_call", (event) => {
+          if (isChildExcludedToolName(event.toolName, readOnly)) {
+            return {
+              block: true,
+              reason: `Tool "${event.toolName}" is not allowed in this child.`,
+            };
+          }
+        });
+      },
+    ],
+  });
   await loader.reload();
   return { loader, settingsManager };
 }
@@ -264,20 +301,46 @@ const makePiSession = (
     }
 
     const model = yield* Effect.try({
-      try: () =>
-        resolvePiModel(registry, task.model, task.parent.inheritedModel),
+      try: () => {
+        const model = task.execution
+          ? registry.find(
+              task.execution.model.provider,
+              task.execution.model.id,
+            )
+          : resolvePiModel(registry, task.model, task.parent.inheritedModel);
+        if (task.execution) {
+          if (!model)
+            throw new Error(
+              `Unknown model "${task.execution.model.provider}/${task.execution.model.id}".`,
+            );
+          if (!registry.hasConfiguredAuth(model)) {
+            throw new Error(
+              `No configured authentication for ${model.provider}/${model.id}.`,
+            );
+          }
+          if (
+            clampThinkingLevel(model, task.execution.thinkingLevel) !==
+            task.execution.thinkingLevel
+          ) {
+            throw new Error(
+              `Unsupported thinking level "${task.execution.thinkingLevel}" for ${model.provider}/${model.id}.`,
+            );
+          }
+        }
+        return model;
+      },
       catch: (error) => new SpawnError({ message: boundedError(error) }),
     });
-    // Reasoning is never independently selected by the child tool: it always
-    // inherits the parent session's current level.
-    const thinkingLevel = task.parent.inheritedThinkingLevel as
-      ThinkingLevel | undefined;
+    // Ordinary children inherit; owned workers use the approved frozen choice.
+    const thinkingLevel = (task.execution?.thinkingLevel ??
+      task.parent.inheritedThinkingLevel) as ThinkingLevel | undefined;
 
     const session = yield* Effect.tryPromise({
       try: async () => {
         const { loader, settingsManager } = await createChildResources(
           task.cwd,
           task.parent.projectTrusted,
+          task.readOnly,
         );
         const { session } = await createAgentSession({
           cwd: task.cwd,
@@ -288,14 +351,33 @@ const makePiSession = (
           thinkingLevel,
           // Keep Pi's normal workspace tools and host filesystem access. This
           // is a denylist, not a sandbox or an accidental tool allowlist.
-          excludeTools: [...CHILD_EXCLUDED_TOOL_NAMES],
+          excludeTools: [
+            ...CHILD_EXCLUDED_TOOL_NAMES,
+            ...(task.readOnly ? ["edit", "write"] : []),
+          ],
         });
         // Start child extension session hooks/resources in headless mode.
         // A rejection here would otherwise leak the freshly created session:
         // the scope finalizer that owns cleanup is only registered later.
         try {
           await session.bindExtensions({ mode: "print" });
-          applyChildToolPolicy(session);
+          if (task.execution) {
+            if (
+              session.model?.provider !== task.execution.model.provider ||
+              session.model?.id !== task.execution.model.id ||
+              session.thinkingLevel !== task.execution.thinkingLevel
+            ) {
+              throw new Error(
+                "Child model/thinking differs from the approved execution choice.",
+              );
+            }
+            const auth = await session.modelRuntime.getAuth(session.model);
+            if (!auth)
+              throw new Error(
+                "Child authentication unavailable for the approved model.",
+              );
+          }
+          applyChildToolPolicy(session, task.readOnly);
         } catch (error) {
           await shutdownAndDisposeChildSession(session);
           throw error;
@@ -345,6 +427,7 @@ const makePiSession = (
       return {
         backend: "pi",
         modelLabel: m ? `${m.provider}/${m.id}` : undefined,
+        thinkingLevel: session.thinkingLevel,
         contextWindow: m?.contextWindow,
         sessionFilePath: session.sessionFile,
       };
@@ -398,7 +481,7 @@ const makePiSession = (
       switch (event.type) {
         case "agent_start":
           // Extensions may register tools between runs; guard new ones too.
-          applyChildToolPolicy(session);
+          applyChildToolPolicy(session, task.readOnly);
           toolTimeout.apply(session);
           state.settled = false;
           emit({ _tag: "RunStarted" });
@@ -525,6 +608,17 @@ const makePiSession = (
         Effect.suspend((): Effect.Effect<void, SendError> => {
           if (state.closed) {
             return new SendError({ message: "Subagent session is closed." });
+          }
+          if (
+            task.execution &&
+            (session.model?.provider !== task.execution.model.provider ||
+              session.model?.id !== task.execution.model.id ||
+              session.thinkingLevel !== task.execution.thinkingLevel)
+          ) {
+            return new SendError({
+              message:
+                "Child model/thinking differs from the approved execution choice.",
+            });
           }
           if (session.isStreaming) {
             // Steer the active run via the SDK's queue; queue_update events

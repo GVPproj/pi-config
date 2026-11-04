@@ -6,7 +6,10 @@
  * normalized `SubagentEvent` union.
  */
 
-import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type {
+  ModelRegistry,
+  createAgentSession,
+} from "@earendil-works/pi-coding-agent";
 import { Data } from "effect";
 
 export type BackendName = "pi";
@@ -30,14 +33,40 @@ export interface SpawnTask {
   readonly cwd: string;
   /** Pi model hint: "provider/model-id" or a bare model id. */
   readonly model?: string;
+  /** Explicit approved execution, required for owned work. */
+  readonly execution?: FrozenExecution;
+  readonly readOnly?: boolean;
   /** Shared effort scale; each backend maps it to its native equivalent. */
   readonly parent: ParentContext;
+}
+
+export type ThinkingLevel = NonNullable<
+  NonNullable<Parameters<typeof createAgentSession>[0]>["thinkingLevel"]
+>;
+
+export interface FrozenExecution {
+  readonly model: { readonly provider: string; readonly id: string };
+  readonly thinkingLevel: ThinkingLevel;
+}
+
+export interface OwnedSpawnTask extends Omit<SpawnTask, "model"> {
+  readonly execution: FrozenExecution;
+  /** Removes edit/write only. Bash and host filesystem access are NOT sandboxed. */
+  readonly readOnly?: boolean;
+}
+
+/** Keep this object private: its identity authorizes owned operations. */
+export interface SubagentOwner {
+  readonly id: string;
+  /** Detached snapshot, once per run, including cancellation/shutdown. */
+  readonly onSettled: (snapshot: SubagentSnapshot) => void;
 }
 
 export interface SubagentMeta {
   readonly backend: BackendName;
   /** Display label, e.g. "opencode-go/glm-5.2". */
   readonly modelLabel?: string;
+  readonly thinkingLevel?: ThinkingLevel;
   /** Context window capacity for utilization display, when known. */
   readonly contextWindow?: number;
   /** Persisted Pi child session file. */
@@ -165,6 +194,10 @@ export interface SubagentSnapshot {
   readonly prompt: string;
   readonly cwd: string;
   readonly status: SubagentStatus;
+  readonly ownerId?: string;
+  readonly execution?: FrozenExecution;
+  readonly readOnly?: boolean;
+  readonly outcome?: RunOutcome["_tag"];
   readonly createdAt: number;
   readonly settledAt?: number;
   readonly errorText?: string;

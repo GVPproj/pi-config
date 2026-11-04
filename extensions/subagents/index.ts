@@ -65,7 +65,23 @@ import {
   type SubagentRuntime,
 } from "./src/runtime.ts";
 import { resolveChildProjectTrust } from "./src/trust.ts";
-import { openSubagentPicker } from "./src/ui/takeover.ts";
+import { openSubagentPicker, openSubagentTakeover } from "./src/ui/takeover.ts";
+import {
+  SUBAGENT_CLIENT_REQUEST,
+  type SubagentClient,
+  type SubagentClientRequest,
+} from "./src/client.ts";
+export {
+  getSubagentManager,
+  type SubagentClient,
+  type OwnedSubagentTask,
+} from "./src/client.ts";
+export type {
+  SubagentOwner,
+  SubagentSnapshot,
+  FrozenExecution,
+  ThinkingLevel,
+} from "./src/domain.ts";
 
 const SUBAGENT_OUTPUT_MAX_BYTES = 24 * 1024;
 const WAIT_OUTPUT_MAX_BYTES = 48 * 1024;
@@ -100,6 +116,7 @@ function truncatedOutput(
 export default function (pi: ExtensionAPI) {
   let runtime: SubagentRuntime | undefined;
   let managerPromise: Promise<SubagentManagerShape> | undefined;
+  let clientPromise: Promise<SubagentClient> | undefined;
   let sessionContext: ExtensionContext | undefined;
   let ui: ExtensionUIContext | undefined;
   let unsubStatus: (() => void) | undefined;
@@ -120,6 +137,88 @@ export default function (pi: ExtensionAPI) {
       });
     return managerPromise;
   };
+
+  const getClient = () => {
+    const activeRuntime = getRuntime();
+    clientPromise ??= getManager().then((manager): SubagentClient => {
+      const assertActive = () => {
+        if (!sessionContext || runtime !== activeRuntime)
+          throw new Error("Subagent manager is no longer active.");
+        return sessionContext;
+      };
+      assertActive();
+      return {
+        async spawnOwned(task, owner) {
+          const ctx = assertActive();
+          const cwd = path.resolve(ctx.cwd, task.cwd);
+          if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory())
+            throw new Error(`working_dir is not a directory: ${cwd}`);
+          const snapshot = await runTool(
+            activeRuntime,
+            manager.spawnOwned(
+              {
+                ...task,
+                cwd,
+                parent: {
+                  parentCwd: ctx.cwd,
+                  projectTrusted: resolveChildProjectTrust({
+                    parentCwd: ctx.cwd,
+                    childCwd: cwd,
+                    parentTrusted: ctx.isProjectTrusted(),
+                  }),
+                  modelRegistry: ctx.modelRegistry,
+                },
+              },
+              owner,
+            ),
+          );
+          return structuredClone(snapshot);
+        },
+        async sendOwned(owner, id, text) {
+          assertActive();
+          await runTool(activeRuntime, manager.sendOwned(owner, id, text));
+        },
+        async cancelOwned(owner, ids) {
+          assertActive();
+          return runTool(activeRuntime, manager.cancelOwned(owner, ids));
+        },
+        get(id) {
+          assertActive();
+          return structuredClone(manager.view.get(id));
+        },
+        list() {
+          assertActive();
+          return structuredClone(manager.view.list());
+        },
+        availableSlots() {
+          assertActive();
+          return manager.view.availableSlots();
+        },
+        subscribe(listener) {
+          assertActive();
+          return manager.view.subscribe(listener);
+        },
+        async openWorker(ctx, id) {
+          const active = assertActive();
+          if (ctx.mode !== "tui")
+            throw new Error("Subagent takeover requires the TUI.");
+          if (
+            ctx.sessionManager.getSessionId() !==
+            active.sessionManager.getSessionId()
+          )
+            throw new Error("Worker belongs to another parent session.");
+          if (!manager.view.get(id))
+            throw new Error(`Unknown subagent "${id}".`);
+          await openSubagentTakeover(ctx, manager.view, id);
+        },
+      };
+    });
+    return clientPromise;
+  };
+
+  const stopClientRequests = pi.events.on(SUBAGENT_CLIENT_REQUEST, (data) => {
+    if (sessionContext) (data as SubagentClientRequest).respond(getClient());
+  });
 
   const updateStatus = (manager: SubagentManagerShape) => {
     if (!ui) return;
@@ -184,6 +283,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     sessionContext = undefined;
+    stopClientRequests();
     resultDelivery.clear();
     unsubStatus?.();
     unsubStatus = undefined;
@@ -192,6 +292,7 @@ export default function (pi: ExtensionAPI) {
     const closing = runtime;
     runtime = undefined;
     managerPromise = undefined;
+    clientPromise = undefined;
     // Disposing the runtime runs the manager finalizer, which tears down all
     // subagent scopes (and, later, their real child processes).
     await closing?.dispose();
@@ -300,6 +401,14 @@ export default function (pi: ExtensionAPI) {
           `Unknown subagent id(s): ${unknown.join(", ")}. Known: ${known.join(", ") || "none"}.`,
         );
       }
+
+      const owned = ids.filter(
+        (id) => manager.view.get(id)?.ownerId !== undefined,
+      );
+      if (owned.length > 0)
+        throw new Error(
+          `Results for owned subagents (${owned.join(", ")}) are delivered exclusively to their owner. Use subagent_check for inspection.`,
+        );
 
       await runTool(
         getRuntime(),
