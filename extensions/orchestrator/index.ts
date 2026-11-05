@@ -13,6 +13,19 @@ import { HerdrWorkspaces } from "./src/herdr.ts";
 import { GithubPublisher } from "./src/github.ts";
 import { sharedWorkers } from "./src/workers.ts";
 import type { Run } from "./src/domain.ts";
+import {
+  formatRun,
+  formatPlan,
+  formatProgress,
+  milestoneKey,
+  widgetLines,
+} from "./src/presentation.ts";
+import {
+  renderCard,
+  renderWidget,
+  expansionHint,
+  type DisplayDetails,
+} from "./src/render.ts";
 
 export function overview(run: Run | undefined) {
   if (!run) return { status: "No run loaded" };
@@ -60,22 +73,45 @@ export default function (pi: ExtensionAPI) {
   let lastMilestone = "";
   let notification: ReturnType<typeof setTimeout> | undefined;
   let pendingRun: Run | undefined;
+  let lastDisplayed: Run | undefined;
   let shuttingDown = false;
+  pi.registerMessageRenderer(
+    "orchestrator-progress",
+    (message, options, theme) => {
+      const details = message.details as Partial<DisplayDetails> | undefined;
+      const fallback =
+        typeof message.content === "string"
+          ? message.content
+          : "Orchestrator update";
+      return renderCard(
+        (options.expanded ? details?.expanded : details?.summary) ?? fallback,
+        theme,
+        options.outputPad,
+        !options.expanded && details?.expanded
+          ? expansionHint(options, "for evidence and workspaces")
+          : undefined,
+      );
+    },
+  );
+  const sendStatus = (run: Run | undefined, summary = formatRun(run)) => {
+    pi.sendMessage(
+      {
+        customType: "orchestrator-progress",
+        content: summary,
+        display: true,
+        details: { summary, expanded: formatRun(run, true), run: run?.id },
+      },
+      { deliverAs: "followUp", triggerTurn: false },
+    );
+  };
   const spaces = new HerdrWorkspaces();
   const flush = () => {
     notification = undefined;
     if (!context || shuttingDown || !pendingRun) return;
     const run = pendingRun;
     pendingRun = undefined;
-    pi.sendMessage(
-      {
-        customType: "orchestrator-progress",
-        content: JSON.stringify(overview(run)),
-        display: true,
-        details: { run: run.id },
-      },
-      { deliverAs: "followUp", triggerTurn: false },
-    );
+    sendStatus(run, formatProgress(run, lastDisplayed));
+    lastDisplayed = structuredClone(run);
   };
   const changed = (run: Run) => {
     if (shuttingDown) return;
@@ -84,14 +120,18 @@ export default function (pi: ExtensionAPI) {
       "orchestrator",
       `${jobs.filter((j) => j.state === "complete").length}/${jobs.length} jobs · ${jobs.filter((j) => j.state === "blocked").length} blocked`,
     );
-    const milestone = JSON.stringify([
-      run.paused,
-      jobs.map((j) => [j.id, j.state, j.stage, j.blocker, j.publication?.sha]),
-      run.integration?.state,
-    ]);
+    if (context?.hasUI) {
+      const lines = widgetLines(run);
+      if (context.mode === "tui") {
+        context.ui.setWidget("orchestrator", (_tui, theme) =>
+          renderWidget(lines, theme),
+        );
+      } else context.ui.setWidget("orchestrator", lines);
+    }
+    const milestone = milestoneKey(run);
     if (milestone === lastMilestone) return;
     lastMilestone = milestone;
-    pendingRun = run;
+    pendingRun = structuredClone(run);
     if (!notification) notification = setTimeout(flush, 500);
     for (const job of jobs)
       if (job.workspace)
@@ -145,6 +185,7 @@ export default function (pi: ExtensionAPI) {
     await engine?.close();
     engine = undefined;
     context?.ui.setStatus("orchestrator", undefined);
+    context?.ui.setWidget("orchestrator", undefined);
     context = undefined;
   });
   pi.registerTool({
@@ -168,6 +209,32 @@ export default function (pi: ExtensionAPI) {
       retrySetup: Type.Optional(Type.Boolean()),
       recoverWorkspace: Type.Optional(Type.Boolean()),
     }),
+    renderCall(args, theme) {
+      return renderCard(
+        `Orchestrator · ${args.action ?? "working"}${args.jobId ? ` · ${args.jobId}` : ""}`,
+        theme,
+      );
+    },
+    renderResult(result, options, theme, ctx) {
+      const display = (
+        result.details as { display?: DisplayDetails } | undefined
+      )?.display;
+      const fallback = result.content
+        .filter((c) => c.type === "text")
+        .map((c) => c.text)
+        .join("\n");
+      return renderCard(
+        options.isPartial
+          ? "Orchestrator · working…"
+          : ((options.expanded ? display?.expanded : display?.summary) ??
+              fallback),
+        theme,
+        0,
+        !options.expanded && display
+          ? expansionHint(ctx, "for details")
+          : undefined,
+      );
+    },
     async execute(_id, input, signal, _update, ctx) {
       const current = await getEngine(ctx);
       signal?.throwIfAborted();
@@ -241,7 +308,30 @@ export default function (pi: ExtensionAPI) {
               }
             : overview(run);
       }
-      const text = JSON.stringify(details, null, 2);
+      const run = current.inspect();
+      const summary =
+        input.action === "prepare" && proposal
+          ? formatPlan(proposal.plan, proposal.digest)
+          : input.action === "open"
+            ? `Opened ${input.jobId}\nActive checkout is not safe for a second writer.`
+            : formatRun(run, false, input.jobId);
+      const displaySummary =
+        input.action === "prepare" && proposal
+          ? [
+              "Orchestrator · Ready for approval",
+              "Nothing started. Isolated worktrees will be retained.",
+              `${proposal.plan.jobs.length} job(s) · ${proposal.plan.delivery} delivery · concurrency ${proposal.plan.concurrency} · repair limit ${proposal.plan.repairLimit}`,
+              `Permissions: ${proposal.plan.permissions.join("; ") || "none"}`,
+              "Expand to review the full scope, commands, models and destination before approving.",
+              `/orchestrator approve ${proposal.digest}`,
+            ].join("\n")
+          : summary;
+      const expanded =
+        input.action === "prepare" || input.action === "open"
+          ? summary
+          : formatRun(run, true, input.jobId);
+      const text =
+        input.jobId && input.action === "inspect" ? expanded : summary;
       return {
         content: [
           {
@@ -252,13 +342,24 @@ export default function (pi: ExtensionAPI) {
                 : text,
           },
         ],
-        details: { overview: details },
+        details: {
+          overview: details,
+          display: { summary: displaySummary, expanded },
+        },
       };
     },
   });
   pi.registerCommand("orchestrator", {
     description:
       "approve <digest> | status | pause | cancel [job] | worker <job> | release",
+    getArgumentCompletions(prefix) {
+      const choices = ["status", "pause", "cancel", "worker", "release"];
+      if (proposal) choices.unshift(`approve ${proposal.digest}`);
+      const items = choices
+        .filter((value) => value.startsWith(prefix))
+        .map((value) => ({ value, label: value }));
+      return items.length ? items : null;
+    },
     async handler(args, ctx) {
       const [action, value] = args.trim().split(/\s+/);
       try {
@@ -287,13 +388,24 @@ export default function (pi: ExtensionAPI) {
           await current.close();
           engine = undefined;
           proposal = undefined;
+          clearTimeout(notification);
+          notification = undefined;
+          pendingRun = undefined;
+          lastDisplayed = undefined;
+          lastMilestone = "";
           ctx.ui.setStatus("orchestrator", undefined);
+          ctx.ui.setWidget("orchestrator", undefined);
+          ctx.ui.notify(
+            "Orchestrator released. Worktrees and evidence retained.",
+            "info",
+          );
           return;
         } else if (action && action !== "status")
           throw new Error(
             "Use approve <digest>, status, pause, cancel [job], worker <job>, or release",
           );
-        ctx.ui.notify(JSON.stringify(overview(current.inspect())), "info");
+        // Control changes already schedule a milestone; avoid duplicate cards.
+        if (!action || action === "status") sendStatus(current.inspect());
       } catch (error) {
         ctx.ui.notify(String(error), "error");
       }

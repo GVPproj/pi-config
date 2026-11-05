@@ -17,13 +17,15 @@ Read `plan.md` (relative to this skill) for the plan format. Write the JSON plan
 
 Present one compact plan covering issues and acceptance criteria, dependency edges/grouping, exact base SHA, branches, delivery mode/destination, all three role models and thinking levels, setup/check commands/timeouts, baseline exceptions, remote CI, concurrency, shared repair limit, retained-checkout policy and external effects (pushes trigger CI). Prefer parent model/thinking for all roles unless the user explicitly chooses overrides. Never substitute an unavailable model.
 
+Present the plan for scanning, not as a wall of prose: start with **Ready for approval — nothing started**, then use short **Scope**, **Execution & checks**, and **Delivery & permissions** sections. Group identical role models together. Keep exact commands/timeouts and the full base SHA in a clearly labelled technical section; link the temporary plan file. Do not echo JSON or repeat the entire tool card. End with the one approval command. Explain that typing that command (Tab completion is available) is required if the user says only “go ahead”.
+
 Ask the user to approve with `/orchestrator approve <digest>`. Do not self-approve or treat a suggested batch as approved. Scope, dependencies, checks, permissions, destinations and model changes need a new approved plan. Ordinary scoped repairs do not.
 
 ## Execution
 
 The extension owns scheduling, worktrees, evidence, publication and integration. Do not start competing workers or manually perform its publication steps. Review workers run after writers settle. All workers share the existing subagent limit. Children cannot spawn reviewers; the extension schedules them.
 
-Use `orchestrator` to inspect, pause, resume, cancel or open work. Routine progress arrives as compact milestones; do not repeatedly poll. Full issue material, logs, diffs and reports are artifacts. Report publication, required CI, integration, cancellation and cleanup separately. A worker's completion message is not verification.
+Use `orchestrator` to inspect, pause, resume, cancel or open work. Routine progress arrives as themed, expandable milestones and a live status panel; do not repeatedly poll or narrate every card again. On a status question, lead with the current phase and what happens next. Explain repair feedback and the round/budget when available. Checks from a previous implementation are historical, not passes for the revised code. Use `/orchestrator status` or expand a card for workspaces and evidence. Never dump raw JSON into the reply. Full issue material, logs, diffs and reports are artifacts. Report publication, required CI, integration, cancellation and cleanup separately. A worker's completion message is not verification.
 
 A job workspace is a retained shell checkout, not an interactive child Pi terminal. Use `/orchestrator worker <job>` for the existing takeover view. An active checkout is not safe for a second writer. Worktrees and tool restrictions are not a sandbox.
 
